@@ -34,6 +34,13 @@ class TemplateArguments:
 
     truncation_strategy: Literal['delete', 'left', 'right', None] = None
     max_pixels: Optional[int] = None
+    resize_history_img: bool = False
+    is_on_PAI: bool = False
+    use_StdTemplateInputs_Customed_by_XWT: bool = False
+    added_special_tokens: Optional[str] = None
+    current_img_num: int = 1
+    fix_img_width: int = 0
+    fix_img_height: int = 0
     agent_template: Optional[str] = None
     norm_bbox: Literal['norm1000', 'none', None] = None
     use_chat_template: Optional[bool] = None
@@ -64,18 +71,25 @@ class TemplateArguments:
             self.truncation_strategy = 'delete'
 
     def get_template_kwargs(self):
-        from ..train_args import TrainArguments
         truncation_strategy = self.truncation_strategy
         if truncation_strategy == 'delete':
             truncation_strategy = 'raise'
-        remove_unused_columns = self.remove_unused_columns  # from DataArguments
-        if not isinstance(self, TrainArguments) or hasattr(self, 'rlhf_type') and self.rlhf_type == 'grpo':
+        remove_unused_columns = self.remove_unused_columns
+        if hasattr(self, 'rlhf_type') and self.rlhf_type == 'grpo':
             remove_unused_columns = True
+        # import pdb;pdb.set_trace()
         return {
             'default_system': self.system,
             'max_length': self.max_length,
             'truncation_strategy': truncation_strategy,
             'max_pixels': self.max_pixels,
+            'added_special_tokens': self.added_special_tokens,
+            'resize_history_img': self.resize_history_img,
+            'is_on_PAI': self.is_on_PAI,
+            'use_StdTemplateInputs_Customed_by_XWT': self.use_StdTemplateInputs_Customed_by_XWT,
+            'current_img_num': self.current_img_num,
+            'fix_img_width': self.fix_img_width,
+            'fix_img_height': self.fix_img_height,
             'agent_template': self.agent_template,
             'norm_bbox': self.norm_bbox,
             'use_chat_template': self.use_chat_template,

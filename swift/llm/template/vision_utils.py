@@ -10,6 +10,7 @@ import numpy as np
 import requests
 import torch
 from PIL import Image
+from PIL import ImageOps
 
 from swift.utils import get_env_args
 
@@ -82,7 +83,9 @@ def _dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbn
 
 
 # <<< internvl
-
+def rescale_image_to_fixed_size(img: Image.Image, height: int, width: int) -> Image.Image:
+    import torchvision.transforms as T
+    return T.Resize((int(height), int(width)))(img)
 
 def rescale_image(img: Image.Image, max_pixels: int) -> Image.Image:
     import torchvision.transforms as T
@@ -132,6 +135,11 @@ def load_image(image: Union[str, bytes, Image.Image]) -> Image.Image:
     image = load_file(image)
     if isinstance(image, BytesIO):
         image = Image.open(image)
+        size = image.size
+        image = ImageOps.exif_transpose(image)
+        if size != image.size:
+            print('image is rotated')
+
     if image.mode != 'RGB':
         image = image.convert('RGB')
     return image

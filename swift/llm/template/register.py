@@ -24,6 +24,15 @@ def get_template(
     *,
     truncation_strategy: Literal['raise', 'left', 'right'] = 'raise',
     max_pixels: Optional[int] = None,  # h * w
+    resize_history_img: bool = False,
+
+    is_on_PAI: bool = False,
+    use_StdTemplateInputs_Customed_by_XWT: bool = False,
+
+    current_img_num: int = 1,
+    fix_img_width: int = 0,
+    fix_img_height: int = 0,
+    added_special_tokens: Optional[str] = None,
     agent_template: Optional[str] = None,
     norm_bbox: Literal['norm1000', 'none', None] = None,
     use_chat_template: bool = True,
@@ -39,6 +48,7 @@ def get_template(
 ) -> 'Template':
     template_meta = TEMPLATE_MAPPING[template_type]
     template_cls = template_meta.template_cls
+    # import pdb;pdb.set_trace()
     return template_cls(
         processor,
         template_meta,
@@ -46,6 +56,15 @@ def get_template(
         max_length,
         truncation_strategy=truncation_strategy,
         max_pixels=max_pixels,
+        resize_history_img = resize_history_img,
+
+        is_on_PAI = is_on_PAI, 
+        use_StdTemplateInputs_Customed_by_XWT = use_StdTemplateInputs_Customed_by_XWT, 
+        
+        current_img_num = current_img_num,
+        fix_img_width = fix_img_width,
+        fix_img_height = fix_img_height,
+        added_special_tokens = added_special_tokens,
         agent_template=agent_template,
         norm_bbox=norm_bbox,
         use_chat_template=use_chat_template,

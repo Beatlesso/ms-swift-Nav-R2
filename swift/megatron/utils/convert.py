@@ -55,7 +55,7 @@ def _find_modules(model, recurse: bool = True):
 
 
 @contextmanager
-def _model_cpu_forward_context(modules, torch_dtype=None, device=None, share_embedding: bool = False):
+def _model_cpu_forward_context(modules, torch_dtype=None, device=None):
     origin_torch_dtype = next(modules[0].parameters()).dtype
 
     def _to_cuda_hook(module, args):
@@ -65,8 +65,6 @@ def _model_cpu_forward_context(modules, torch_dtype=None, device=None, share_emb
             module.to(torch_dtype)
 
     def _to_cpu_hook(module, args, output):
-        if share_embedding and module is modules[0]:
-            return
         module.to('cpu')
         if torch_dtype is not None:
             module.to(origin_torch_dtype)
@@ -91,11 +89,9 @@ def test_convert_precision(hf_model, mg_model, processor, torch_dtype=torch.floa
     input_ids = torch.tensor(input_ids)[None].to('cuda')
 
     HfConfigFactory.set_model_config_attr(hf_model, 'use_cache', False)
-    share_embedding = mg_model.share_embeddings_and_output_weights
     hf_modules = _find_modules(hf_model)
-    with torch.inference_mode(), _model_cpu_forward_context(hf_modules, torch_dtype, share_embedding=share_embedding):
+    with torch.inference_mode(), _model_cpu_forward_context(hf_modules, torch_dtype):
         hf_logits = hf_model(input_ids).logits
-    hf_model = hf_model.to('cpu')
 
     attention_mask, _, position_ids = get_ltor_masks_and_position_ids(input_ids, -100, True, True, True)
     packed_seq_params = None
@@ -105,10 +101,8 @@ def test_convert_precision(hf_model, mg_model, processor, torch_dtype=torch.floa
     # mg_torch_dtype = None
     # packed_seq_params = get_packed_seq_params(position_ids)
     # attention_mask = None
-    mg_model.config.fp8 = None  # compat fp8
     mg_modules = _find_modules(mg_model)
-    with torch.inference_mode(), _model_cpu_forward_context(
-            mg_modules, mg_torch_dtype, 'cuda', share_embedding=share_embedding):
+    with torch.inference_mode(), _model_cpu_forward_context(mg_modules, mg_torch_dtype, 'cuda'):
         mg_logits = mg_model(
             input_ids=input_ids,
             attention_mask=attention_mask,

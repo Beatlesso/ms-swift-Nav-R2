@@ -232,8 +232,11 @@ class Qwen2VLTemplate(Template):
     version = 'v2'
     use_model = True
 
+    SPECIAL_TOKEN_MISSIONSTARTTOKEN_customed_by_xwt = '<|I_AM_MISSON_START_TOKEN|>'
+    SPECIAL_NAVTOKEN_customed_by_xwt = '<|NAV|>'
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
+        # import pdb;pdb.set_trace()
         from qwen_vl_utils import fetch_image, fetch_video
         assert media_type in {'image', 'video'}
         if media_type == 'image':
@@ -263,14 +266,15 @@ class Qwen2VLTemplate(Template):
         processor = self.processor
         input_ids = encoded['input_ids']
         labels = encoded['labels']
+        original_images = inputs.original_images
         images = inputs.images
         videos = inputs.videos
         for media_type in ['images', 'videos']:
             if locals()[media_type]:
                 if media_type == 'images':
                     media_token = self.image_token_id
-                    media_inputs = processor.image_processor(
-                        images=images, videos=None, return_tensors='pt', do_resize=False)
+                    media_inputs = processor.image_processor( # 这里进入transformers/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py文件的Qwen2VLImageProcessor类的preprocess函数
+                        images=images, videos=None, return_tensors='pt', do_resize=False, original_images = original_images)
                     media_grid_thw = media_inputs['image_grid_thw']
                 else:
                     if hasattr(processor, 'video_processor'):
@@ -312,9 +316,31 @@ class Qwen2VLTemplate(Template):
         inputs['position_ids'] = inputs.pop('real_position_ids')
         return self._patch_flash_attention_forward(modeling_module, position_ids)
 
+    # 原版的不带帧压缩的_post_encode版本
     def _post_encode(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not self.is_training:
             return inputs
+
+
+
+        input_ids = inputs['input_ids']              # [B, L]
+        special_token_id_NAVTOKEN_customed_by_xwt = self.tokenizer.encode(self.SPECIAL_NAVTOKEN_customed_by_xwt)[0]
+        NAVTOKEN_index = input_ids == special_token_id_NAVTOKEN_customed_by_xwt
+
+        whether_apply_compressing_code_customed_by_XWT = True
+        if NAVTOKEN_index.flatten().sum() > 0:
+            # 是导航任务
+            if whether_apply_compressing_code_customed_by_XWT:
+                try:
+                    return self._post_encode_compresshistoricalimages_and_concat_with_currentimage(model, inputs)
+                except Exception as e:
+                    print("********* ERROR ***********")
+                    print("self._post_encode_compresshistoricalimages_and_concat_with_currentimage")
+                    print(e)
+                    print("********* ERROR ***********\n\n\n\n")
+
+        # 不是导航任务，走vqa
+
         input_ids = inputs['input_ids']
         pixel_values = inputs.get('pixel_values')
         pixel_values_videos = inputs.get('pixel_values_videos')
@@ -326,7 +352,7 @@ class Qwen2VLTemplate(Template):
             inputs_embeds = base_model.model.embed_tokens(input_ids)
         else:
             inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
-
+        # import pdb;pdb.set_trace()
         dtype = model.visual.get_dtype() if self.version == 'v2' else model.visual.dtype
         if pixel_values is None and pixel_values_videos is None:  # plain-text
             if is_deepspeed_enabled():
@@ -340,11 +366,13 @@ class Qwen2VLTemplate(Template):
                 inputs_embeds += image_embeds.mean() * 0.
         else:
             if pixel_values is not None:
+                # 在这里调用model内部封装好的函数，去维护memory、得到增强后的特征这些
+                # 
                 pixel_values = pixel_values.type(dtype)
                 image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
                 image_mask = (input_ids == model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds) # inputs_embeds在scatter前后的维度不变
 
             if pixel_values_videos is not None:
                 pixel_values_videos = pixel_values_videos.type(dtype)
@@ -355,6 +383,234 @@ class Qwen2VLTemplate(Template):
 
         return {'inputs_embeds': inputs_embeds}
 
+
+
+    def _post_encode_compresshistoricalimages_and_concat_with_currentimage(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        inputs.keys()
+            dict_keys(['input_ids', 'labels', 'attention_mask', 'pixel_values', 'image_grid_thw', 'memory_images_pixel_values', 'current_image_vision_grid_thws', 'current_image_pixel_values', 'memory_images_vision_grid_thws', 'position_ids', 'future_images', 'action_label', 'id'])
+        """
+
+        # 这个版本不缩放原始rgb图，是在函数中对historical image的embedding调用model.pool进行压缩，再把压缩后的memory和current image拼接后，覆盖到输入序列embedding中的image token位置
+        # 但是有bug，在训练到第2个step时，显卡会报显存异常访问的错.....
+        # return self._post_encode_compresshistoricalimages_and_concat_with_currentimage__________do_not_resize_original_rgb_image__sequence_length_modified_bug_exists_when_iter_for_2_times(
+        #     model, inputs
+        # )
+
+        # 这个版本缩放原始rgb图，但同时会把没有缩放的rgb图也传到这里
+        # 在函数中对未缩放的图的image embedding调用model.pool进行压缩，pool后的每张history image的embedding数和resize rgb后得到的embedding数相同
+        # 然后直接覆盖到序列中对应的位置
+        return self._post_encode_compresshistoricalimages_and_concat_with_currentimage__________resize_original_rgb_image__sequence_length_the_same__pool_original_size_embedding_to_fit_the_same_length(
+            model, inputs
+        )
+
+
+    def _post_encode_compresshistoricalimages_and_concat_with_currentimage__________resize_original_rgb_image__sequence_length_the_same__pool_original_size_embedding_to_fit_the_same_length(self, model, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        inputs.keys() 要想增加key-values对，得走swift/llm/template/template/qwen.py文件的_data_collator_mm_data函数去添加keys_want，函数返回的key-value就对应到这里的inputs里
+            dict_keys(['input_ids', 'labels', 'attention_mask', 'pixel_values', 'image_grid_thw', 'memory_images_pixel_values', 'current_image_vision_grid_thws', 'current_image_pixel_values', 'memory_images_vision_grid_thws', 'position_ids', 'future_images', 'action_label', 'id'])
+        """
+        # import time
+        # start_1 = time.time()
+        if not self.is_training:
+            return inputs
+        # import pdb;pdb.set_trace()
+        ##########
+        ##########
+        ##########
+        ##########
+        ##########
+        # 硬编码
+        image_embedding_count_per_image_after_modelvisual = 437 # 暂时写死为437，这个是未resize的原图经model.visual后的token数
+        image_embedding_count_per_resized_image_after_modelvisual = 30 # 暂时写死为30，resize过后的原图经model.visual后的token数
+        ##########
+        ##########
+        ##########
+        ##########
+        ##########
+
+        device = inputs['input_ids'].device
+        base_model = self.get_base_model(model)
+        image_token_id = model.config.image_token_id
+
+        input_ids = inputs['input_ids']              # [B, L]
+        labels = inputs['labels']                    # [B, L]
+        attention_mask = inputs['attention_mask']    # [B, L]
+        position_ids = inputs['position_ids']        # [*, B, L]
+        pixel_values = inputs['pixel_values']        # [43700, 1176]
+        image_grid_thw = inputs['image_grid_thw']    # [25, 3]
+        # assert all(torch.equal(x, image_grid_thw[0]) for x in image_grid_thw), '' # 暂时写死，反正所有输入图像的大小都一样，切片方式也肯定是一样的，写死了方便后面compress
+        original_current_image_pixel_values, original_current_image_vision_grid_thws, original_memory_images_pixel_values, original_memory_images_vision_grid_thws = inputs['original_current_image_pixel_values'], inputs['original_current_image_vision_grid_thws'], inputs['original_memory_images_pixel_values'], inputs['original_memory_images_vision_grid_thws']
+        # import pdb;pdb.set_trace()
+        special_token_id_NAVTOKEN_customed_by_xwt = self.tokenizer.encode(self.SPECIAL_NAVTOKEN_customed_by_xwt)[0]
+        special_token_id_MISSIONSTARTTOKEN_customed_by_xwt = self.tokenizer.encode(self.SPECIAL_TOKEN_MISSIONSTARTTOKEN_customed_by_xwt)[0]
+        MISSIONSTARTTOKEN_index = input_ids == special_token_id_MISSIONSTARTTOKEN_customed_by_xwt # b,n
+        NAVTOKEN_index = input_ids == special_token_id_NAVTOKEN_customed_by_xwt
+        # MISSIONSTARTTOKEN_index = MISSIONSTARTTOKEN_index.int().argmax(1) # b，代表每个sample中mission内容开始的下标，直接取这个下标之后的内容就是mission text的embedding
+        # 1. 得到每个样本的True索引
+        idxs_mission_start_token = torch.argmax(MISSIONSTARTTOKEN_index.int(), dim=1)   # shape (4,)
+        idxs_nav_token = torch.argmax(NAVTOKEN_index.int(), dim=1)   # shape (4,)
+        # 2. 扩展 arange 到 batch 维度
+        length = input_ids.size(1)
+        arange_mission_start_token = torch.arange(length, device=input_ids.device).expand(input_ids.size(0), length)
+        arange_nav_token = torch.arange(length, device=input_ids.device).expand(input_ids.size(0), length)
+        # 3. 构造 mask
+        mask_mission_start_token = arange_mission_start_token >= idxs_mission_start_token.unsqueeze(1)    # shape (4, 5), True/False
+        mask_nav_token = arange_nav_token <= idxs_nav_token.unsqueeze(1)    # shape (4, 5), True/False
+        # 4. 更新 tensor
+        MISSIONTEXT_filter_out_mask = mask_nav_token & mask_mission_start_token # 为
+
+
+        inputs_embeds = None
+        base_model = self.get_base_model(model)
+        if hasattr(base_model.model, 'embed_tokens'):
+            inputs_embeds = base_model.model.embed_tokens(input_ids)
+        else:
+            inputs_embeds = base_model.model.language_model.embed_tokens(input_ids)
+
+        # 只取mission_text对应的embedding
+        mission_text_embed_list = [row[mask_i] for row, mask_i in zip(inputs_embeds, MISSIONTEXT_filter_out_mask)]
+
+        if pixel_values is None and pixel_values_videos is None:  # plain-text
+            if is_deepspeed_enabled():
+                from PIL import Image
+                images = [Image.new('RGB', (32, 32), (0, 0, 0))]
+                media_inputs = self.processor.image_processor(images=images, videos=None, return_tensors='pt')
+                device = input_ids.device
+                media_inputs = to_device(media_inputs, device)
+                pixel_values = media_inputs['pixel_values'].type(dtype)
+                image_embeds = model.visual(pixel_values, grid_thw=media_inputs['image_grid_thw'])
+                inputs_embeds += image_embeds.mean() * 0.
+        else:
+            pixel_values = None
+            del pixel_values
+            if not all(torch.equal(x, image_grid_thw[0]) for x in image_grid_thw):
+                # print('\n\n\n\n****************')
+                # print('***** WARNING !*******')
+                # print('The elements in image _grid_thw are not all the same!')
+                # print('****************\n\n\n\n')
+                pass
+            num_image_tokens_per_sample = (input_ids == image_token_id).sum(dim=1).tolist()  # [737, 737, 437, 467] 从这里面能看出每个sample的image embedding个数，然后如果单个sample只有1个<image> special token，那就知道经modle.visual过后会有多少个embedding出现在输入序列中。然后，比较两条sample，一个sample有1个<image> token另一个有2个<image> token，所以多出来的30就是resize过后的图片对应的embeddin数
+
+            batch_size = input_ids.shape[0]
+
+            dtype = model.visual.get_dtype() if hasattr(model.visual, 'get_dtype') else model.visual.dtype
+            # pixel_values = pixel_values.to(device, dtype=dtype)
+            image_grid_thw = image_grid_thw.to(device)
+            total_image_count_across_all_samples_in_a_batch = len(image_grid_thw)
+
+
+
+
+
+
+
+
+            # 统计每个sample中有多少张图片
+            unique_rows, counts = torch.unique(image_grid_thw, return_counts=True, dim=0)
+            mask = counts == batch_size
+            image_grid_thw_belong_to_current_image = unique_rows[mask][0]
+            image_token_count_of_each_sample = []
+                
+            # Step 3: 找出关键图像在原序列中的所有位置
+            is_key = (image_grid_thw == image_grid_thw_belong_to_current_image).all(dim=1)  # [N], bool
+            key_indices = torch.nonzero(is_key, as_tuple=False).squeeze(1)  # [batch_size], GPU
+
+            # Step 4: 构造分段边界
+            boundaries = torch.cat([torch.tensor([0], dtype=torch.long, device=device), key_indices + 1, torch.tensor([image_grid_thw.size(0)], dtype=torch.long, device=device)])  # [batch_size + 2]
+
+            # Step 5: 相邻边界之差 = 每段长度
+            image_count_of_per_sample = boundaries[1:] - boundaries[:-1]  # [batch_size + 1]
+            image_count_of_per_sample = image_count_of_per_sample[image_count_of_per_sample!=0]
+            memory_image_count_of_per_sample = image_count_of_per_sample - 1
+            memory_embedding_count_after_compreesion_of_per_sample = image_embedding_count_per_resized_image_after_modelvisual * memory_image_count_of_per_sample # batch中的每个sample的memory有多少个图片
+            # import pdb;pdb.set_trace()
+
+
+
+
+
+
+
+            # 编码memory
+            # memory_images_pixel_values, original_memory_images_pixel_values = inputs['memory_images_pixel_values'], inputs['original_memory_images_pixel_values']
+            original_memory_images_pixel_values = inputs['original_memory_images_pixel_values']
+            # memory_images_vision_grid_thws, original_memory_images_vision_grid_thws = inputs['memory_images_vision_grid_thws'], inputs['original_memory_images_vision_grid_thws']
+            # memory_images_vision_grid_thws, original_memory_images_vision_grid_thws = memory_images_vision_grid_thws.to(dtype=image_grid_thw.dtype, device=image_grid_thw.device), original_memory_images_vision_grid_thws.to(dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+            original_memory_images_vision_grid_thws = inputs['original_memory_images_vision_grid_thws']
+            original_memory_images_vision_grid_thws = original_memory_images_vision_grid_thws.to(dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+
+            # start_2 = time.time()
+            original_memory_images_embedding = model.visual(original_memory_images_pixel_values, grid_thw=original_memory_images_vision_grid_thws) # (600,3584) (8740, 3584)
+
+
+
+
+
+            original_current_image_pixel_values = inputs['original_current_image_pixel_values'] # 不resize的情况下，每个image的pixel_values有1748个patch，(1748, 1176)
+            original_current_image_vision_grid_thws = inputs['original_current_image_vision_grid_thws']
+            original_current_image_vision_grid_thws = original_current_image_vision_grid_thws.to(dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+            # start_4 = time.time()
+            original_current_image_embedding = model.visual(original_current_image_pixel_values, grid_thw=original_current_image_vision_grid_thws) # torch.Size([1748, 3584])，1748/4=437，相当于不resize rgb的情况下，每个image有437个embedding
+            # start_5 = time.time()
+            num_tokens_per_image = [image_embedding_count_per_image_after_modelvisual for _ in range(batch_size)]
+            # num_tokens_per_image = [437 for _ in range(4)]
+            original_current_image_embedding_list_batch = torch.split(original_current_image_embedding, num_tokens_per_image, dim=0) # [1748, 3584] -> [4, 437, 3584]
+            original_current_image_embedding_list_batch = [item for item in original_current_image_embedding_list_batch]
+
+
+
+
+            # start_3 = time.time()
+            # 压缩memory
+            merge_size = getattr(self.processor.image_processor, 'merge_size', 2)
+            compressed_original_memory_images_embedding_list_batch = model.model.compress_historical_image_features(
+                original_memory_images_embedding,  # [N, D]
+                image_grid_thw = original_memory_images_vision_grid_thws,
+                merge_size = merge_size,
+                mission_text_embed_list = mission_text_embed_list,
+                memory_image_count_of_per_sample = memory_image_count_of_per_sample,
+                original_current_image_embedding_list_batch = original_current_image_embedding_list_batch
+            )  # [bxn, d],   torch.Size([8740, 3584])->torch.Size([600, 3584])
+            compressed_original_memory_images_embedding_list_batch = torch.split(compressed_original_memory_images_embedding_list_batch, memory_embedding_count_after_compreesion_of_per_sample.tolist(), dim=0)
+            # 恢复batch结构
+            compressed_original_memory_images_embedding_list_batch = [item for item in compressed_original_memory_images_embedding_list_batch]
+            # self._preprocess( image, do_resize=do_resize, size=size, resample=resample, do_rescale=do_rescale, rescale_factor=rescale_factor, do_normalize=do_normalize, image_mean=image_mean, image_std=image_std, patch_size=patch_size, temporal_patch_size=temporal_patch_size, merge_size=merge_size, data_format=data_format, do_convert_rgb=do_convert_rgb, input_data_format=input_data_format, )
+
+
+
+
+            # 拼接压缩后的memory和current image，按batch_index拼接，相当于还原每个sample的image顺序
+            final_image_embedding_list = []
+
+            augmented_mission_text_embed_list = []
+            # import pdb;pdb.set_trace()
+            for batch_index in range(batch_size):
+                image_count_of_current_sample = image_count_of_per_sample[batch_index]
+                current_sample_image_embedding = torch.cat([compressed_original_memory_images_embedding_list_batch[batch_index], original_current_image_embedding_list_batch[batch_index]], dim = 0) # [n, d]
+
+                final_image_embedding_list.append(
+                    current_sample_image_embedding
+                ) # 每个元素都是memory+current image的顺序，都是[n,d]维度
+            final_image_embedding = torch.cat(final_image_embedding_list, dim=0) # 需要对比这个和直接pixel_values经过model.visual得到的embedding的维度区别，应该要相同
+
+            # import pdb;pdb.set_trace()
+            
+            image_mask = (input_ids == model.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+            final_image_embedding = final_image_embedding.to(inputs_embeds.device, inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, final_image_embedding) # inputs_embeds在scatter前后的维度不变
+        # time_4 = time.time()
+
+        del final_image_embedding, original_current_image_embedding_list_batch, compressed_original_memory_images_embedding_list_batch, original_current_image_embedding, original_current_image_pixel_values, original_memory_images_embedding, original_memory_images_pixel_values
+
+        # print("original_memory_images_embedding = model.visual: {}s".format(start_3 - start_2))
+        # print("original_current_image_embedding = model.visual: {}s".format(start_5 - start_4))
+        # print("encode function {}s".format(time_4 - start_1))
+
+        return {
+            'inputs_embeds': inputs_embeds,
+        }
+
     def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         res = super()._data_collator_mm_data(batch)
         second_per_grid_ts = self.gather_list(batch, 'second_per_grid_ts')
@@ -364,6 +620,24 @@ class Qwen2VLTemplate(Template):
             grid_thw = self.concat_tensor(batch, f'{media_type}_grid_thw', 0)
             if grid_thw is not None:
                 res[f'{media_type}_grid_thw'] = grid_thw
+        # print('_data_collator_mm in swift/llm/template/template/qwen.py')
+        # print([item.keys() for item in batch])
+        # print()
+        # import pdb;pdb.set_trace()
+        t_keys_list = [list(item.keys()) for item in batch]
+        keys_list = []
+        for item in t_keys_list:
+            keys_list += item
+        keys_list = set(keys_list)
+        keys_want = ["memory_images_vision_grid_thws", "memory_images_pixel_values", "current_image_pixel_values", "current_image_vision_grid_thws",
+            "original_memory_images_vision_grid_thws", "original_memory_images_pixel_values", "original_current_image_pixel_values", "original_current_image_vision_grid_thws",
+        ]
+        for k in keys_list:
+            if k in keys_want:
+                memory_images_vision_grid_thws = self.concat_tensor(batch, k, 0)
+                if memory_images_vision_grid_thws is not None:
+                    res[k] = memory_images_vision_grid_thws
+        # print(res.keys())
         return res
 
     def packing_row(self, row: List[Tuple[Dict[str, Any], int]]) -> Dict[str, Any]:
@@ -395,6 +669,9 @@ class Qwen2VLTemplate(Template):
         return position_ids.contiguous()
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        # print('_data_collator in swift/llm/template/template/qwen.py')
+        # print([item.keys() for item in batch])
+        # print()
         res = super()._data_collator(batch, padding_to=padding_to)
         if self._packing:
             res['real_position_ids'] = self.concat_tensor(batch, 'real_position_ids', -1)
@@ -468,6 +745,7 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
             return ['<|vision_bos|><|VIDEO|><|vision_eos|>']
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        # import pdb;pdb.set_trace()
         encoded = Template._encode(self, inputs)
         processor = self.processor
         video_audios_mask = []

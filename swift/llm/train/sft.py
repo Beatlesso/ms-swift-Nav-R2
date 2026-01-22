@@ -43,6 +43,14 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             sequence_parallel.init_sequence_parallel(args.sequence_parallel_size)
         self.model, self.processor = args.get_model_processor()
 
+        if self.args.added_special_tokens is not None:
+            self.tokenizer.add_special_tokens(
+                {
+                    'additional_special_tokens': [line.strip() for line in open(self.args.added_special_tokens)]
+                }
+            )
+            print('all_special_tokens after add: ', self.tokenizer.all_special_tokens)
+
         if hasattr(self.model, 'hf_device_map'):
             logger.info(f'model.hf_device_map: {self.model.hf_device_map}')
 
@@ -61,6 +69,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
     def _get_dataset(self):
         # The random shuffling of the training set occurs in the dataloader of the trainer.
         args = self.args
+        # import pdb;pdb.set_trace()
         dataset_kwargs = args.get_dataset_kwargs()
         train_dataset, val_dataset = load_dataset(
             args.dataset, split_dataset_ratio=args.split_dataset_ratio, shuffle=args.dataset_shuffle, **dataset_kwargs)
@@ -93,6 +102,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
         args = self.args
 
         train_dataset, val_dataset = self._get_dataset()
+        # import pdb;pdb.set_trace()
         train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset)
 
         if args.task_type == 'seq_cls':
@@ -235,6 +245,7 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                         strict=args.strict,
                         load_from_cache_file=args.load_from_cache_file)
             elif args.lazy_tokenize:
+                # import pdb;pdb.set_trace()
                 train_dataset = LazyLLMDataset(
                     train_dataset, template.encode, strict=args.strict, random_state=args.data_seed)
                 if val_dataset is not None and not predict_with_generate:

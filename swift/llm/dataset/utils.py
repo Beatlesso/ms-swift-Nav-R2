@@ -97,7 +97,9 @@ class LazyLLMDataset(Dataset):
                 self._idx = (self._idx + 1) % len(self.dataset)
             data = self.dataset[i]
             try:
-                return self.encode_func(data)
+                ret = self.encode_func(data) # 在这里data还没变成id，还是文本形式，返回的ret就已经变成了id了，而且image被切分了
+                # print("swift/llm/dataset/utils.py __getitem__ ret.keys:\t", ret.keys()) # 这里会先把数据集中的所有数据都加载并编码完，结束了才会进入llm的forward
+                return ret
             except Exception:
                 if n_try == self.n_try_fetch - 1 or self.strict:
                     if self.strict:

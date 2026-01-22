@@ -198,3 +198,62 @@ class StdTemplateInputs:
                     res[f'{key}s'].append(value)
             message['content'] = new_content
         return res
+
+
+@dataclass
+class StdTemplateInputs_Customed_by_XWT(StdTemplateInputs):
+    # only user/tool/assistant
+    messages: List[Dict[str, str]]
+    # None: use default system; '': not use system
+    system: Optional[str] = None
+    tools: Optional[List[Tool]] = None
+
+    rejected_response: Optional[str] = None
+    label: Optional[int] = None
+    channel: Optional[str] = None
+
+    images: List[Union[str, Image.Image]] = field(default_factory=list)
+    original_images: List[Union[str, Image.Image]] = field(default_factory=list)
+    audios: List[str] = field(default_factory=list)
+    videos: List[str] = field(default_factory=list)
+    objects: Dict[str, List[Any]] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, inputs: Dict[str, Any]) -> Tuple['StdTemplateInputs', Dict[str, Any]]:
+        kwargs = {}
+        for key in ['rejected_response', 'label', 'channel']:
+            if key in inputs:
+                kwargs[key] = inputs[key]
+        messages = inputs['messages']
+        tools = inputs.get('tools')
+        objects = inputs.get('objects') or {}
+
+        if messages and messages[0]['role'] == 'system':
+            message = messages.pop(0)
+            system = message['content']
+        else:
+            system = None
+
+        for message in messages:
+            if message['role'] == 'tool_response':
+                message['role'] = 'tool'
+            if message['role'] in {'tool_call', 'tool'} and not isinstance(message['content'], str):
+                message['content'] = json.dumps(message['content'], ensure_ascii=False)
+
+        media_kwargs = StdTemplateInputs.remove_messages_media(messages)
+        for k in list(media_kwargs.keys()):
+            mm_data = media_kwargs[k]
+
+            inputs_mm_data = inputs.get(k)
+            if isinstance(inputs_mm_data, str):
+                inputs_mm_data = [inputs_mm_data]
+            inputs_mm_data = (inputs_mm_data or []).copy()
+            if mm_data:
+                assert not inputs_mm_data, f'self.{k}: {inputs_mm_data}'
+            else:
+                media_kwargs[k] = inputs_mm_data
+
+        all_keys = set(f.name for f in fields(StdTemplateInputs))
+        extra_kwargs = {k: v for k, v in inputs.items() if k not in all_keys}
+        return cls(
+            messages=messages, system=system, tools=tools, objects=objects, **kwargs, **media_kwargs), extra_kwargs

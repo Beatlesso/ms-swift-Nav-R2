@@ -23,9 +23,71 @@ from transformers.utils import strtobool
 
 from swift.utils import get_dist_setting, get_env_args, get_logger, use_torchacc
 from ..utils import Processor, ProcessorMixin
-from .template_inputs import InferRequest, StdTemplateInputs, TemplateInputs
+from .template_inputs import InferRequest, StdTemplateInputs, TemplateInputs, StdTemplateInputs_Customed_by_XWT # 新增了StdTemplateInputs_Customed_by_XWT这个类的使用，继承自StdTemplateInputs
 from .utils import Context, ContextType, StopWordsCriteria, fetch_one, findall, split_str_parts_by
-from .vision_utils import load_audio, load_batch, load_image, rescale_image
+from .vision_utils import load_audio, load_batch, load_image, rescale_image,rescale_image_to_fixed_size
+
+
+import random
+from PIL import Image, ImageEnhance, ImageOps, ImageDraw
+
+def nav_image_augment_pil(image: Image.Image) -> Image.Image:
+    """
+    用 Pillow 实现导航任务图像增强：
+    亮度对比度随机变化、小尺度随机平移/旋转裁剪、随机部分遮挡、低分辨率/压缩。
+    不依赖额外第三方库。
+    """
+    # 确保是 RGB
+    image = image.convert("RGB")
+
+    w, h = image.size
+
+    # 1. 亮度对比度随机变化
+    if random.random() < 0.1:  # 50%概率增强
+        enhancer_brightness = ImageEnhance.Brightness(image)
+        image = enhancer_brightness.enhance(random.uniform(0.8, 1.2))  # 亮度因子
+
+        enhancer_contrast = ImageEnhance.Contrast(image)
+        image = enhancer_contrast.enhance(random.uniform(0.8, 1.2))  # 对比度因子
+
+    # 2. 小尺度随机平移 / 旋转裁剪
+    if random.random() < 0.1:
+        # 随机旋转
+        angle = random.uniform(-5, 5)  # 小角度旋转
+        image = image.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=(0, 0, 0))
+
+        # 随机平移裁剪（先裁掉一点边，再填充回来）
+        shift_x = random.randint(-int(0.01*w), int(0.01*w))  # 平移比例 5%
+        shift_y = random.randint(-int(0.01*h), int(0.01*h))
+        image = ImageOps.expand(image.crop((
+            max(0, shift_x),
+            max(0, shift_y),
+            min(w, w+shift_x),
+            min(h, h+shift_y)
+        )), border=(abs(shift_x), abs(shift_y)), fill=(0, 0, 0))
+
+    # 3. 随机部分遮挡
+    if random.random() < 0.1:
+        draw = ImageDraw.Draw(image)
+        num_blocks = random.randint(1, 2)
+        for _ in range(num_blocks):
+            x0 = random.randint(0, image.width - 20)
+            y0 = random.randint(0, image.height - 20)
+            x1 = x0 + random.randint(10, 20)
+            y1 = y0 + random.randint(10, 20)
+            draw.rectangle([x0, y0, x1, y1], fill=(0, 0, 0))
+
+    # 4. 低分辨率 / 压缩
+    if random.random() < 0.1:
+        # 模拟低分辨率: 缩小再放大
+        small_size = (int(image.width * random.uniform(0.5, 0.75)),
+                      int(image.height * random.uniform(0.5, 0.75)))
+        image = image.resize(small_size, Image.BICUBIC)
+        image = image.resize((image.width * (w // small_size[0]),
+                              image.height * (h // small_size[1])), Image.BICUBIC)
+        image = image.resize((w, h), Image.BICUBIC)
+
+    return image
 
 logger = get_logger()
 if TYPE_CHECKING:
@@ -61,6 +123,13 @@ class Template(ProcessorMixin):
         *,
         truncation_strategy: Literal['raise', 'left', 'right'] = 'raise',
         max_pixels: Optional[int] = None,
+        added_special_tokens: Optional[str] = None,
+        resize_history_img: bool = False,
+        is_on_PAI: bool = False,
+        use_StdTemplateInputs_Customed_by_XWT: bool= False,
+        current_img_num: int = 1,
+        fix_img_width: int = 0,
+        fix_img_height: int = 0,
         agent_template: Optional[str] = None,
         norm_bbox: Literal['norm1000', 'none', None] = None,
         use_chat_template: bool = True,
@@ -108,6 +177,15 @@ class Template(ProcessorMixin):
         self.truncation_strategy = truncation_strategy
         self.loss_scale = loss_scale_map[loss_scale]()
         self.max_pixels = max_pixels
+        self.added_special_tokens = added_special_tokens
+        self.resize_history_img = resize_history_img
+
+        self.is_on_PAI = is_on_PAI # debug on PAI needing this parameter
+        self.use_StdTemplateInputs_Customed_by_XWT = use_StdTemplateInputs_Customed_by_XWT # whether use customed template
+
+        self.current_img_num = current_img_num
+        self.fix_img_width = fix_img_width
+        self.fix_img_height = fix_img_height
         self.padding_side = padding_side
         self.sequence_parallel_size = sequence_parallel_size
         self.padding_free = padding_free
@@ -230,10 +308,20 @@ class Template(ProcessorMixin):
             else:
                 i += 1
 
+    def process_images_specific_on_PAI(self, images):
+        import copy
+        ret = copy.deepcopy(images)
+
+        return ret
+
+
     def _preprocess_inputs(
         self,
         inputs: StdTemplateInputs,
     ) -> None:
+        if self.is_on_PAI:
+            pass
+        # import pdb;pdb.set_trace()
         self._preprocess_function_call(inputs)
         if self.model_meta.is_multimodal:
             self._replace_image_tags(inputs)
@@ -244,6 +332,13 @@ class Template(ProcessorMixin):
         if self.max_pixels is not None or inputs.objects:
             load_images = True
         if images:
+
+            # import pdb;pdb.set_trace()
+
+            if self.is_on_PAI: # debug on PAI needed
+                assert False, "not supported on PAI"
+                images = self.process_images_specific_on_PAI(images)
+
             for i, image in enumerate(images):
                 images[i] = self._load_image(images[i], load_images)
         if inputs.objects:
@@ -255,7 +350,23 @@ class Template(ProcessorMixin):
             for i, image in enumerate(images):
                 if isinstance(image, Image.Image):
                     images[i] = self._save_pil_image(image)
-        inputs.images = images
+        if '<|NAV|>' in inputs.messages[0]['content']:
+        # if 1:
+            if self.fix_img_width >0 and self.fix_img_height>0:
+                images = [rescale_image_to_fixed_size(img,self.fix_img_height,self.fix_img_width) for idx,img in enumerate(images)]
+            images = [
+                nav_image_augment_pil(item) for item in images
+            ]
+            resized_images = []
+            if self.resize_history_img:
+                resized_images = [rescale_image_to_fixed_size(img,int(img.height/4),int(img.width/4)) if idx < len(images)-self.current_img_num else img for idx,img in enumerate(images)]
+
+            
+
+
+        inputs.images = resized_images
+        inputs.original_images = images
+        # import pdb;pdb.set_trace()
 
         if self.mode == 'vllm' and inputs.audios:
             sampling_rate = get_env_args('sampling_rate', int, None)
@@ -440,7 +551,7 @@ class Template(ProcessorMixin):
                inputs: Union[TemplateInputs, Dict[str, Any], InferRequest],
                return_template_inputs: bool = False) -> Dict[str, Any]:
         """The entrance method of Template!
-
+        在这里面完成的文本编码和图像切分和编码
         Returns:
             return {'input_ids': List[int], 'labels': Optional[List[int]], ...}
         """
@@ -454,7 +565,10 @@ class Template(ProcessorMixin):
             inputs = deepcopy(inputs)
             if not self.is_training:
                 InferRequest.remove_response(inputs['messages'])
-            inputs, extra_kwargs = StdTemplateInputs.from_dict(inputs)
+            if self.use_StdTemplateInputs_Customed_by_XWT:
+                inputs, extra_kwargs = StdTemplateInputs_Customed_by_XWT.from_dict(inputs)
+            else:
+                inputs, extra_kwargs = StdTemplateInputs.from_dict(inputs)
         elif isinstance(inputs, StdTemplateInputs):
             inputs = deepcopy(inputs)
         assert isinstance(inputs, StdTemplateInputs)
@@ -718,7 +832,7 @@ class Template(ProcessorMixin):
     @staticmethod
     def _split_special_tokens(context_list: List[Context],
                               loss_scale_list: List[float]) -> Tuple[List[Context], List[float]]:
-        """Split special tokens, for example `<image>`, `<video>`, this will help the replace_tag operation"""
+        """Split special tokens, for example `<image>`, `<video>`, this will help the replace_tag operation 会按成对的special token把special token和之间的文本都提取出来，每对special token是一个元素"""
         res: List[Context] = []
         loss_scale_res: List[float] = []
         for context, loss_scale in zip(context_list, loss_scale_list):
@@ -1034,11 +1148,10 @@ class Template(ProcessorMixin):
                 res_context_list.append(bos_token)
                 res_context_types.append(ContextType.OTHER)
 
-        if self.template_meta.is_post_system or not system:
-            prefix = template_meta.prefix
-        else:
-            prefix = template_meta.system_prefix
+        prefix = template_meta.system_prefix if system else template_meta.prefix
         self._concat_context_list(prefix, res_context_list, res_context_types, system=system)
+
+        # import pdb;pdb.set_trace()
 
         n_round = len(inputs.messages) // 2
         for i, (query_message, response_message) in enumerate(zip(inputs.messages[::2], inputs.messages[1::2])):
@@ -1073,7 +1186,6 @@ class Template(ProcessorMixin):
             elif template_meta.response_prefix:
                 # final round and during inference.
                 context_list.append(template_meta.response_prefix)
-
             self._concat_context_list(
                 context_list,
                 res_context_list,
@@ -1173,7 +1285,7 @@ class Template(ProcessorMixin):
         else:
             res_context_list, loss_scale_list = self._simplify_context_list(res_context_list, loss_scale_list, inputs)
             input_ids, labels, loss_scale, tokenizer_kwargs = self._encode_context_list(
-                res_context_list, loss_scale_list)
+                res_context_list, loss_scale_list) # 在这里实现的将文本编码成id
         self._add_dynamic_eos(input_ids, labels, loss_scale, self._encode_context_list(self.template_meta.suffix)[0])
 
         if tokenizer_kwargs:
@@ -1250,8 +1362,9 @@ class Template(ProcessorMixin):
     def post_process_generate_response(self, response: str, inputs: StdTemplateInputs) -> str:
         return response
 
-    def pre_forward_hook(self, model: nn.Module, args, kwargs):
+    def pre_forward_hook(self, model: nn.Module, args, kwargs): # 增加减少forward函数的输入参数个数和名称
         from swift.llm import to_device
+        # import pdb;pdb.set_trace()
         old_kwargs = to_device(kwargs, model.device)
         kwargs = to_device(self._post_encode(model, old_kwargs), model.device)
         for k, v in old_kwargs.items():
@@ -1781,3 +1894,4 @@ class Template(ProcessorMixin):
             yield
         finally:
             modeling_module._flash_attention_forward = _origin_flash_attention_forward
+
